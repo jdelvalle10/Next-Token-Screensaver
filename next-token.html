@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Next Token</title>
+<style>
+  :root {
+    --bg: #04060c;
+    --ink: #e9edf6;
+    --label: #ffd27a;
+    --caption: #f2f4fa;
+    --caption-soft: #9aa6bf;
+    --muted: #6b7690;
+  }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--ink);
+    cursor: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  body.preview { cursor: default; }
+  #stage { position: fixed; inset: 0; overflow: hidden;
+    background: radial-gradient(ellipse at 50% 42%, #0b1222 0%, #060913 55%, #020308 100%); }
+  #fx { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .ui { font-family: "Ubuntu", "Segoe UI", "Helvetica Neue", "DejaVu Sans", Arial, sans-serif; }
+  #steps { position: absolute; top: 3.2vh; left: 50%; transform: translateX(-50%); display: flex; gap: 2.4vw;
+    white-space: nowrap; opacity: 0; }
+  .step { display: flex; align-items: baseline; gap: 0.5em; font-size: 2.1vh; color: var(--muted); opacity: 0.55; }
+  .step .n { display: inline-block; width: 1.6em; height: 1.6em; line-height: 1.6em; text-align: center; border-radius: 50%;
+    border: 1px solid currentColor; font-size: 0.85em; }
+  .step .es { font-size: 0.8em; opacity: 0.8; }
+  .step.on { color: var(--label); opacity: 1; }
+  .step.done { opacity: 0.8; color: var(--caption-soft); }
+  #caption { position: absolute; left: 50%; top: 76.5vh; transform: translateX(-50%); width: 84vw; text-align: center; opacity: 0; }
+  #caption .tag { color: var(--label); font-size: 2.2vh; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 1vh; }
+  #caption .en { color: var(--caption); font-size: 2.9vh; line-height: 1.3; }
+  #caption .es { color: var(--caption-soft); font-size: 2.5vh; line-height: 1.3; margin-top: 0.7vh; font-style: italic; }
+  #credit { position: absolute; right: 1.6vw; bottom: 1vh; font-size: 1.45vh; color: var(--muted); opacity: 0.8; }
+  #hint { position: absolute; left: 50%; bottom: 1.4vh; transform: translateX(-50%); font-size: 1.9vh; color: var(--caption-soft);
+    opacity: 0; transition: opacity 1.2s; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="fx"></canvas>
+  <div id="steps" class="ui"></div>
+  <div id="caption" class="ui"><div class="tag"></div><div class="en"></div><div class="es"></div></div>
+  <div id="credit" class="ui">Next Token — how a language model writes · cómo escribe un modelo de lenguaje · illustrative numbers · números ilustrativos</div>
+  <div id="hint" class="ui">Touch to exit · Toque para salir</div>
+</div>
+<script>
+(() => {
+"use strict";
+
+/* ===================== Configuration ===================== */
+const CYCLE = 44;                       // seconds per loop
+const params = new URLSearchParams(location.search);
+const KIOSK = params.get("kiosk") === "1";
+const num = (k, parse) => { const v = params.has(k) ? parse(params.get(k)) : NaN; return Number.isFinite(v) ? v : null; };
+const FROZEN_T = num("t", parseFloat);
+const FORCED_PROMPT = num("p", s => parseInt(s, 10));
+const FORCED_BEAT = num("beat", s => parseInt(s, 10));
+const FX_MAX_W = num("fxw", parseFloat) || 3840;   // cap on canvas pixel width (4K performance)
+if (!KIOSK) document.body.classList.add("preview");
+
+const FONT = '"Ubuntu", "Segoe UI", "Helvetica Neue", "DejaVu Sans", Arial, sans-serif';
+const MONO = '"Ubuntu Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace';
+const INK = [233, 237, 246], MUTED = [154, 166, 191], GOLD = [255, 210, 122];
+const NEG = [76, 141, 255], POS = [255, 159, 67];     // vector cells: negative / positive values
+const BAR = [154, 184, 255];
+const TOKCOL = [[95, 212, 255], [255, 179, 71], [109, 255, 170], [255, 122, 217], [192, 139, 255], [154, 184, 255], [255, 138, 122]];
+const DIM = 12;                         // vector cells shown per token
+
+/* Example prompts (rotate each loop). IDs, attention and probabilities are illustrative.
+   attn: how much the last prompt token attends to each prompt token (including itself).
+   cands: top next-token candidates; pick: the one sampled; next: the token generated after it. */
+const PROMPTS = [
+  { toks: ["The", " capital", " of", " France", " is"], ids: [791, 6864, 315, 9822, 374],
+    attn: [0.04, 0.31, 0.07, 0.46, 0.12],
+    cands: [[" Paris", 0.91], [" a", 0.03], [" the", 0.02], [" located", 0.01], [" home", 0.01]], pick: 0,
+    next: ".", genIds: [12366, 13] },
+  { toks: ["El", " agua", " hier", "ve", " a", " 100"], ids: [3451, 41289, 64317, 588, 264, 1041],
+    attn: [0.03, 0.24, 0.17, 0.12, 0.11, 0.33],
+    cands: [[" grados", 0.86], [" °C", 0.07], [" centígrados", 0.03], [" grado", 0.01], [" por", 0.01]], pick: 0,
+    next: ".", genIds: [52384, 13] },
+  { toks: ["Twinkle", " twinkle", " little"], ids: [42253, 98226, 2697],
+    attn: [0.36, 0.33, 0.31],
+    cands: [[" star", 0.97], [" twinkle", 0.008], [" bat", 0.004], [" stars", 0.004], [" light", 0.002]], pick: 0,
+    next: ",", genIds: [6917, 11] },
+  { toks: ["Había", " una", " vez", " un"], ids: [79723, 5203, 14373, 653],
+    attn: [0.18, 0.14, 0.27, 0.41],
+    cands: [[" rey", 0.24], [" niño", 0.19], [" hombre", 0.11], [" pequeño", 0.08], [" dragón", 0.05]], pick: 1,
+    next: " que", genIds: [62541, 1744] },
+  { toks: ["The", " cat", " sat", " on", " the"], ids: [791, 8415, 7731, 389, 279],
+    attn: [0.04, 0.33, 0.25, 0.19, 0.19],
+    cands: [[" mat", 0.38], [" floor", 0.17], [" couch", 0.11], [" bed", 0.07], [" window", 0.05]], pick: 0,
+    next: ".", genIds: [5634, 13] },
+  { toks: ["La", " foto", "sín", "tesis", " ocurre", " en", " las"], ids: [8921, 26303, 59165, 52511, 75611, 665, 5252],
+    attn: [0.03, 0.17, 0.12, 0.15, 0.22, 0.09, 0.22],
+    cands: [[" hojas", 0.62], [" plantas", 0.14], [" células", 0.09], [" partes", 0.03], [" algas", 0.02]], pick: 0,
+    next: ".", genIds: [70254, 13] },
+];
+
+const STEPS = [
+  { en: "Tokens", es: "Tokens" },
+  { en: "Vectors", es: "Vectores" },
+  { en: "Attention", es: "Atención" },
+  { en: "Layers", es: "Capas" },
+  { en: "Prediction", es: "Predicción" },
+  { en: "Repeat", es: "Repetir" },
+];
+
+/* Captions (one per step) */
+const SCENES = [
+  { step: 0, a: 0.6, b: 6.0,
+    en: "The text is cut into pieces called tokens: whole words or parts of words. Each token has an ID number.",
+    es: "El texto se corta en piezas llamadas tokens: palabras enteras o partes de palabras. Cada token tiene un número." },
+  { step: 1, a: 6.2, b: 12.0,
+    en: "Each ID is swapped for a long list of numbers, a vector. Tokens with similar meanings get similar vectors.",
+    es: "Cada número se cambia por una larga lista de números, un vector. Los tokens con significados parecidos tienen vectores parecidos." },
+  { step: 2, a: 12.2, b: 19.0,
+    en: "Attention: each token looks back at the tokens before it and takes in information from the ones that matter most.",
+    es: "Atención: cada token mira los tokens anteriores y toma información de los que más importan." },
+  { step: 3, a: 19.2, b: 26.0,
+    en: "This repeats through dozens of layers. Billions of numbers learned in training (parameters) shape every step.",
+    es: "Esto se repite en decenas de capas. Miles de millones de números aprendidos en el entrenamiento (parámetros) guían cada paso." },
+  { step: 4, a: 26.2, b: 31.0,
+    en: "The result: a probability for every token the model knows. Which one is most likely to come next?",
+    es: "El resultado: una probabilidad para cada token que conoce el modelo. ¿Cuál es el más probable a continuación?" },
+  { step: 5, a: 31.2, b: 36.5,
+    en: "One token is picked (usually a likely one, with a little randomness), added to the text, and everything runs again.",
+    es: "Se elige un token (normalmente uno probable, con un poco de azar), se añade al texto y todo vuelve a empezar." },
+];
+
+/* Rotating end-of-loop beat: limits and how it learned */
+const BEATS = [
+  { tag: "How did it learn? · ¿Cómo aprendió?",
+    en: "Training: it guessed the next token across a huge amount of text, and after every miss its parameters were nudged to do a little better.",
+    es: "Entrenamiento: adivinó el siguiente token en una enorme cantidad de texto, y tras cada error sus parámetros se ajustaron para hacerlo un poco mejor." },
+  { tag: "Careful · Cuidado",
+    en: "It predicts likely words, not checked facts. It can sound sure of itself and still be wrong: a “hallucination”.",
+    es: "Predice palabras probables, no hechos comprobados. Puede sonar muy seguro y aun así equivocarse: una “alucinación”." },
+  { tag: "Its limits · Sus límites",
+    en: "It can only see a limited amount of text at once (its context window), and its knowledge stops where its training data ends.",
+    es: "Solo puede ver una cantidad limitada de texto a la vez (su ventana de contexto), y su conocimiento termina donde terminan sus datos de entrenamiento." },
+  { tag: "Same question, new answer · Misma pregunta, otra respuesta",
+    en: "Because each token is picked with a little randomness, asking the same thing twice can give different answers.",
+    es: "Como cada token se elige con un poco de azar, preguntar lo mismo dos veces puede dar respuestas distintas." },
+];
+
+/* Timeline (seconds within the loop) */
+const T_TYPE = [0.3, 1.7], T_SPLIT = [1.9, 2.8], T_IDS = 3.0;
+const T_WORK = [6.0, 7.0], T_COLS = 7.0, T_COLLAPSE = [12.0, 12.8];
+const T_FOCUS = [13.0, 16.3], T_ALL = [16.0, 18.9];
+const T_ROWS = 19.0, T_WAVE = 20.2, WAVE_DT = 0.85;
+const T_CHART = [26.3, 33.6], T_SAMPLE = [31.0, 32.4], T_FLY = [32.4, 33.3];
+const T_REPLAY = 33.3, REPLAY_DT = 0.2, T_SECOND = [34.4, 34.9], T_GRID_OUT = [34.8, 35.3];
+const T_MERGE = [35.3, 36.5], T_BEAT = [36.8, 41.0], T_DISSOLVE = 41.0;
+
+/* ===================== Helpers ===================== */
+const $ = (s, r = document) => r.querySelector(s);
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, k) => a + (b - a) * k;
+const prog = (t, a, b) => clamp((t - a) / (b - a));              // 0..1 over [a,b]
+const easeOut = k => 1 - Math.pow(1 - k, 3);
+const easeIn = k => k * k * k;
+const easeInOut = k => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+const win = (t, a, b, fi, fo) => Math.min(prog(t, a, a + fi), 1 - prog(t, b - fo, b)); // fade-in/out window
+const rgba = (c, a) => `rgba(${clamp(c[0], 0, 255)|0},${clamp(c[1], 0, 255)|0},${clamp(c[2], 0, 255)|0},${clamp(a)})`;
+const mix = (c1, c2, k) => [lerp(c1[0], c2[0], k), lerp(c1[1], c2[1], k), lerp(c1[2], c2[2], k)];
+function rng(seed) {                         // mulberry32: deterministic randomness
+  let s = seed >>> 0;
+  return () => { s = (s + 0x6D2B79F5) >>> 0; let r = Math.imul(s ^ (s >>> 15), 1 | s);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r); return ((r ^ (r >>> 14)) >>> 0) / 4294967296; };
+}
+const hash = (n) => { const r = rng(n * 9973 + 17); return r(); };
+const label = tk => tk.trim() || "␣";
+const pct = p => p < 0.01 ? "<1%" : Math.round(p * 100) + "%";
+const fmt = v => (v < 0 ? "−" : "") + Math.abs(v).toFixed(2);
+const font = (px, w = 600, fam = FONT) => `${w} ${px.toFixed(1)}px ${fam}`;
+const bez = (p, k) => { const u = 1 - k;
+  return [u * u * p[0][0] + 2 * u * k * p[1][0] + k * k * p[2][0], u * u * p[0][1] + 2 * u * k * p[1][1] + k * k * p[2][1]]; };
+
+/* ===================== DOM refs ===================== */
+const canvas = $("#fx"), ctx = canvas.getContext("2d");
+const stepsEl = $("#steps"), capEl = $("#caption"), capTag = $("#caption .tag"), capEn = $("#caption .en"), capEs = $("#caption .es");
+const hintEl = $("#hint");
+const stepEls = STEPS.map((s, i) => { const d = document.createElement("div"); d.className = "step";
+  d.innerHTML = `<span class="n">${i + 1}</span><span class="en">${s.en}</span>` + (s.es !== s.en ? `<span class="es">${s.es}</span>` : "");
+  stepsEl.append(d); return d; });
+
+/* ===================== Canvas primitives ===================== */
+function measure(text, px, w = 600) { ctx.font = font(px, w); return ctx.measureText(text).width; }
+function rrect(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath(); ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function dotf(x, y, rad, c, a) { if (a <= 0.003) return; ctx.fillStyle = rgba(c, a); ctx.beginPath(); ctx.arc(x, y, rad, 0, 6.2832); ctx.fill(); }
+function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+// Soft glows use cached radial-gradient sprites (one per quantized color) drawn additively.
+const glowCache = new Map();
+function glow(x, y, rad, c, a) {
+  if (a <= 0.003 || rad <= 0) return;
+  const q = c.map(v => Math.min(255, Math.round(v / 16) * 16)), key = q.join();
+  let s = glowCache.get(key);
+  if (!s) { s = document.createElement("canvas"); s.width = s.height = 128; const g = s.getContext("2d");
+    const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gr.addColorStop(0, rgba(q, 1)); gr.addColorStop(0.3, rgba(q, 0.35)); gr.addColorStop(1, rgba(q, 0));
+    g.fillStyle = gr; g.fillRect(0, 0, 128, 128); glowCache.set(key, s); }
+  ctx.globalCompositeOperation = "lighter"; ctx.globalAlpha = clamp(a);
+  ctx.drawImage(s, x - rad, y - rad, 2 * rad, 2 * rad);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+}
+const PAD = 0.32, GAP = 0.45;               // chip padding and gap, in units of font size
+function chip(cx, cy, fs, text, col, boxA, tc, a) {
+  ctx.font = font(fs); const tw = ctx.measureText(text).width;
+  if (boxA > 0.01) { const w = tw + 2 * PAD * fs, h = fs * 1.5; rrect(cx - w / 2, cy - h / 2, w, h, fs * 0.28);
+    ctx.fillStyle = rgba(col, 0.16 * boxA * a); ctx.fill();
+    ctx.lineWidth = Math.max(1.5, fs * 0.05); ctx.strokeStyle = rgba(col, 0.9 * boxA * a); ctx.stroke(); }
+  ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillStyle = rgba(tc, a);
+  ctx.fillText(text, cx, cy + fs * 0.03);
+}
+
+/* ===================== Layout (per prompt and screen size) ===================== */
+let L = null, promptIdx = -1, beatIdx = 0;
+
+// Positions of each token inside a plain line of text: center of its visible (trimmed) part.
+function textRuns(toks, fs, W) {
+  let x = (W - measure(toks.join(""), fs)) / 2; const x0 = x;
+  const runs = toks.map(tk => { const lead = measure(tk.match(/^\s*/)[0], fs), w = measure(tk, fs);
+    const r = { x: x + lead, cx: x + lead + (w - lead) / 2 }; x += w; return r; });
+  return { x0, x1: x, runs };
+}
+
+function layout() {
+  const W = innerWidth, H = innerHeight;
+  const P = PROMPTS[promptIdx];
+  const all = P.toks.concat([P.cands[P.pick][0], P.next]), ids = P.ids.concat(P.genIds);
+  const T = P.toks.length, N = all.length;
+  const dpr = devicePixelRatio || 1, fxScale = Math.min(dpr, FX_MAX_W / W);
+  canvas.width = Math.round(W * fxScale); canvas.height = Math.round(H * fxScale);
+
+  // Scene 1: the prompt as plain text, then split into chips (same font size)
+  const splitWidth = fs => P.toks.reduce((s, tk) => s + measure(label(tk), fs) + 2 * PAD * fs, 0) + GAP * fs * (T - 1);
+  let sfs = H * 0.062; sfs = Math.min(sfs, sfs * 0.9 * W / splitWidth(sfs));
+  const sentY = H * 0.42, sent = textRuns(P.toks, sfs, W);
+  let x = (W - splitWidth(sfs)) / 2;
+  const split = P.toks.map(tk => { const w = measure(label(tk), sfs) + 2 * PAD * sfs; const cx = x + w / 2; x += w + GAP * sfs; return cx; });
+
+  // Working row: room for the prompt plus the two generated tokens
+  const wx0 = W * 0.11, wx1 = W * 0.60, sp = (wx1 - wx0) / (N - 1);
+  const unit = Math.max(...all.map(tk => measure(label(tk), 100))) / 100;
+  const wfs = Math.min(H * 0.034, 0.88 * sp / (unit + 2 * PAD));
+  const work = all.map((_, i) => wx0 + i * sp);
+  const chipY = H * 0.70, chipH = wfs * 1.5;
+  const rowY = Array.from({ length: 6 }, (_, r) => lerp(H * 0.60, H * 0.21, r / 5));
+  const colBot = chipY - chipH / 2 - H * 0.025, colTop = H * 0.25;
+  const cellH = (colBot - colTop) / DIM, cellW = Math.min(sp * 0.5, H * 0.065);
+
+  // Probability chart (right side)
+  const cunit = Math.max(...P.cands.map(c => measure(label(c[0]), 100))) / 100;
+  const chart = { x0: W * 0.665, labR: W * 0.775, barX: W * 0.785, barMax: W * 0.12, y0: H * 0.30, dy: H * 0.07,
+    titleY: H * 0.225, fs: Math.min(H * 0.03, W * 0.10 / cunit) };
+
+  // Final sentence (prompt + generated tokens)
+  let ffs = H * 0.062; const fw = measure(all.join(""), ffs); if (fw > 0.88 * W) ffs *= 0.88 * W / fw;
+  const fin = textRuns(all, ffs, W);
+  const finOff = fin.runs.map(r => T_DISSOLVE + 1.6 * clamp((r.cx - fin.x0) / (fin.x1 - fin.x0)) - 0.1);
+
+  // Colors: each prompt token has its own; generated tokens are gold.
+  // Higher layers blend each token toward the average of the tokens up to it (context mixing).
+  const tokCol = all.map((_, i) => i < T ? TOKCOL[i % TOKCOL.length] : GOLD);
+  const prefAvg = tokCol.map((_, i) => { const s = [0, 0, 0];
+    for (let k = 0; k <= i; k++) for (let c = 0; c < 3; c++) s[c] += tokCol[k][c] / (i + 1); return s; });
+
+  const r = rng(promptIdx * 7919 + 11);
+  const vecs = ids.map(id => { const q = rng(id * 31 + 5); return Array.from({ length: DIM }, () => (q() * 2 - 1) * (0.3 + 0.7 * q())); });
+  const att = all.map((_, j) => { if (j === T - 1) return P.attn.slice();
+    const q = rng(ids[j] * 13 + 7), w = Array.from({ length: j + 1 }, () => 0.2 + q()), s = w.reduce((a, b) => a + b, 0);
+    return w.map(v => v / s); });
+
+  // Sampling: a highlight steps through the candidates, slowing down, and stops on the pick
+  const NH = 11, ds = Array.from({ length: NH }, (_, k) => Math.pow(1.22, k)), dsc = (T_SAMPLE[1] - T_SAMPLE[0] - 0.05) / ds.reduce((a, b) => a + b, 0);
+  const hops = ds.map((d, k) => ({ d: d * dsc, k: ((P.pick - (NH - 1 - k)) % 5 + 5) % 5 }));
+
+  // Dust for the dissolve: sample the pixels of the final sentence
+  const dust = [];
+  { const s = 0.5, oc = document.createElement("canvas"); oc.width = Math.ceil(W * s); oc.height = Math.ceil(ffs * 2.2 * s);
+    const g = oc.getContext("2d"); g.scale(s, s); g.font = font(ffs); g.textBaseline = "middle"; g.fillStyle = "#fff";
+    fin.runs.forEach((run, i) => g.fillText(label(all[i]), run.x, ffs * 1.1));
+    const img = g.getImageData(0, 0, oc.width, oc.height).data, pts = [];
+    for (let y = 0; y < oc.height; y += 2) for (let xx = 0; xx < oc.width; xx += 2)
+      if (img[(y * oc.width + xx) * 4 + 3] > 120) pts.push([xx / s, y / s - ffs * 1.1 + sentY]);
+    const keep = Math.min(1, 2600 / (pts.length || 1)), genX = fin.runs[T].x - ffs * 0.1;
+    pts.forEach(p => { if (r() > keep) return;
+      dust.push({ x: p[0], y: p[1], t0: T_DISSOLVE + 1.6 * clamp((p[0] - fin.x0) / (fin.x1 - fin.x0)) + r() * 0.25,
+        vx: (0.03 + r() * 0.07) * W, vy: -(0.02 + r() * 0.07) * H, ph: r() * 6.28, s: r(), gold: p[0] >= genX }); }); }
+
+  // Background: a faint, slowly drifting network of "parameters"
+  const bg = Array.from({ length: 80 }, () => ({ x: r() * W, y: r() * H, ax: (0.01 + 0.02 * r()) * W, ay: (0.01 + 0.02 * r()) * H,
+    ph: r() * 6.28, sp: 0.05 + 0.08 * r() }));
+  const links = [];
+  bg.forEach((a, i) => bg.forEach((b, j) => { if (j > i && Math.hypot(a.x - b.x, a.y - b.y) < W * 0.11) links.push([i, j]); }));
+
+  const centerOff = W / 2 - (work[0] + work[T - 1]) / 2;
+
+  L = { W, H, fxScale, P, all, T, N, centerOff, ox: 0, sfs, sentY, sent, split, wfs, work, chipY, rowY, colBot, colTop, cellH, cellW,
+    chart, ffs, fin, finOff, tokCol, prefAvg, vecs, att, hops, dust, bg, links };
+}
+
+function nodeCol(i, r) { return mix(L.tokCol[i], L.prefAvg[i], 0.8 * r / 5); }
+
+/* ===================== Drawing ===================== */
+function drawField(el, t) {
+  const { bg, links, H } = L;
+  const boost = win(t, T_ROWS, 26.5, 1.0, 1.5);           // the network wakes up while the layers run
+  const pos = bg.map(p => [p.x + Math.sin(el * p.sp + p.ph) * p.ax, p.y + Math.cos(el * p.sp * 0.8 + p.ph) * p.ay]);
+  ctx.lineWidth = 1; ctx.strokeStyle = rgba([120, 150, 220], 0.045 + 0.06 * boost); ctx.beginPath();
+  links.forEach(([a, b]) => { ctx.moveTo(pos[a][0], pos[a][1]); ctx.lineTo(pos[b][0], pos[b][1]); });
+  ctx.stroke();
+  pos.forEach(q => dotf(q[0], q[1], H * 0.0018, [150, 180, 240], 0.16 + 0.14 * boost));
+}
+
+// 2. Vectors: each token's ID becomes a column of numbers
+function drawColumns(t) {
+  if (t < T_COLS || t > T_COLLAPSE[1]) return;
+  const { T, work, colBot, colTop, cellH, cellW, vecs, rowY, H } = L;
+  const c = easeIn(prog(t, T_COLLAPSE[0], T_COLLAPSE[1]));
+  const nfs = Math.min(cellH * 0.48, cellW * 0.27);
+  for (let i = 0; i < T; i++) {
+    const shown = DIM * prog(t, T_COLS + i * 0.18, T_COLS + 1.0 + i * 0.18);
+    for (let k = 0; k < DIM; k++) {
+      const a = clamp(shown - k) * (1 - c); if (a <= 0) continue;
+      const v = vecs[i][k], y = lerp(colBot - (k + 0.5) * cellH, rowY[0], c);
+      const w = cellW * (1 - c), h = (cellH - 2) * (1 - c * 0.7);
+      ctx.fillStyle = rgba(v > 0 ? POS : NEG, (0.18 + 0.6 * Math.abs(v)) * a);
+      rrect(work[i] - w / 2, y - h / 2, w, h, Math.min(4, h / 3)); ctx.fill();
+      if (c < 0.3) { ctx.font = font(nfs, 500, MONO); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillStyle = rgba(INK, 0.85 * a * (1 - c / 0.3)); ctx.fillText(fmt(v), work[i], y); }
+    }
+  }
+  const la = win(t, 8.4, T_COLLAPSE[0], 0.5, 0.4);
+  if (la > 0) { ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.font = font(H * 0.022, 500); ctx.fillStyle = rgba(MUTED, la);
+    ctx.fillText("Each column is a vector: thousands of numbers (12 shown)", work[0] - cellW / 2, colTop - H * 0.045);
+    ctx.font = font(H * 0.02, 400); ctx.fillStyle = rgba(MUTED, 0.8 * la);
+    ctx.fillText("Cada columna es un vector: miles de números (se ven 12)", work[0] - cellW / 2, colTop - H * 0.018); }
+}
+
+// 3. Attention: the last token looks back at every token; then every token does the same
+function drawAttention(t) {
+  if (t < T_FOCUS[0] || t > T_ALL[1]) return;
+  const { T, work, rowY, H, att, tokCol } = L, y = rowY[0];
+  const arc = (i, j) => [[work[i], y], [(work[i] + work[j]) / 2, y - H * (0.07 + 0.045 * (j - i))], [work[j], y]];
+  const stroke = (a, rev) => { ctx.beginPath(); const n = Math.round(40 * rev);
+    for (let s = 0; s <= n; s++) { const p = bez(a, s / 40); s ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); } ctx.stroke(); };
+  const fa = win(t, T_FOCUS[0], T_FOCUS[1], 0.4, 0.5), j = T - 1;
+  if (fa > 0) {
+    for (let i = 0; i < j; i++) {
+      const w = att[j][i], a = arc(i, j), rev = easeOut(prog(t, T_FOCUS[0] + 0.12 * i, T_FOCUS[0] + 0.7 + 0.12 * i));
+      ctx.lineWidth = H * (0.0015 + 0.012 * w); ctx.strokeStyle = rgba(mix(tokCol[i], INK, 0.3), (0.25 + 0.7 * w) * fa);
+      stroke(a, rev);
+      if (rev >= 1) for (let q = 0; q < 2; q++) { const p = bez(a, ((t - T_FOCUS[0]) * 0.7 + q * 0.5 + i * 0.13) % 1);
+        glow(p[0], p[1], H * (0.012 + 0.03 * w), tokCol[i], 0.8 * fa); }
+    }
+    ctx.font = font(H * 0.024, 600); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (let i = 0; i <= j; i++) { ctx.fillStyle = rgba(i === j ? GOLD : INK, fa * prog(t, 13.6 + 0.12 * i, 14.0 + 0.12 * i));
+      ctx.fillText(pct(att[j][i]), work[i], y + H * 0.038); }
+  }
+  const aa = win(t, T_ALL[0], T_ALL[1], 0.5, 0.5);
+  if (aa > 0) for (let jj = 1; jj < T; jj++) for (let i = 0; i < jj; i++) {
+    const w = att[jj][i], a = arc(i, jj);
+    ctx.lineWidth = H * (0.001 + 0.004 * w); ctx.strokeStyle = rgba(mix(tokCol[i], INK, 0.3), (0.08 + 0.4 * w) * aa); stroke(a, 1);
+    const p = bez(a, ((t - T_ALL[0]) * 0.6 + i * 0.17 + jj * 0.29) % 1); glow(p[0], p[1], H * 0.012, tokCol[i], 0.6 * aa);
+  }
+}
+
+// 3–6. The network: one node per token per layer; each node connects to its own and earlier tokens below
+function drawGrid(t) {
+  if (t < 12.3 || t > T_GRID_OUT[1]) return;
+  const { T, work, rowY, H } = L;
+  const fade = 1 - prog(t, T_GRID_OUT[0], T_GRID_OUT[1]);
+  const replay = t >= T_REPLAY, nC = replay ? T + 1 : T, focus = replay ? T : T - 1;
+  // When each node lights up. The replay only computes the new token (earlier ones are reused).
+  const litAt = (r, i) => i === T ? T_REPLAY + r * REPLAY_DT : r === 0 ? 12.3 : T_WAVE + (r - 1) * WAVE_DT;
+  const pulse = i => i === T ? REPLAY_DT : 0.7;
+  const dimOther = 1 - 0.6 * prog(t, 26.0, 26.6);
+  const colA = i => (i === focus ? 1 : dimOther) * (i === T ? prog(t, T_REPLAY, T_REPLAY + 0.3) : 1);
+  const rowA = r => r === 0 ? prog(t, 12.3, 12.9) : prog(t, T_ROWS + r * 0.15, T_ROWS + 0.5 + r * 0.15);
+
+  for (let r = 1; r < 6; r++) {
+    const ra = rowA(r) * fade; if (ra <= 0) continue;
+    for (let j = 0; j < nC; j++) {
+      const at = litAt(r, j), u = prog(t, at - pulse(j), at), active = u > 0 && u < 1;
+      for (let i = 0; i <= j; i++) {
+        const a = ra * Math.min(colA(i), colA(j));
+        ctx.lineWidth = active ? 2 : 1;
+        ctx.strokeStyle = rgba(mix(nodeCol(i, r - 1), [200, 215, 255], 0.5), (t >= at ? 0.16 : 0.07) * a + (active ? 0.35 * a : 0));
+        line(work[i], rowY[r - 1], work[j], rowY[r]);
+        if (active) dotf(lerp(work[i], work[j], u), lerp(rowY[r - 1], rowY[r], u), H * 0.004, nodeCol(i, r - 1), 0.9 * a);
+      }
+    }
+  }
+  for (let r = 0; r < 6; r++) {
+    const ra = rowA(r) * fade; if (ra <= 0) continue;
+    for (let j = 0; j < nC; j++) {
+      const at = litAt(r, j), ca = colA(j) * ra, c = nodeCol(j, r);
+      if (t >= at) { const flash = 1 - prog(t, at, at + 0.6);
+        glow(work[j], rowY[r], H * (0.03 + 0.03 * flash), c, (0.3 + 0.6 * flash) * ca); dotf(work[j], rowY[r], H * 0.010, c, 0.95 * ca); }
+      else { ctx.strokeStyle = rgba(c, 0.35 * ca); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(work[j], rowY[r], H * 0.009, 0, 6.2832); ctx.stroke(); }
+    }
+  }
+  // The last layer of the newest token is what makes the prediction
+  glow(work[focus], rowY[5], H * 0.07, [255, 240, 200], 0.5 * win(t, 26.0, T_CHART[1], 0.5, 0.5) * fade);
+
+  const la = prog(t, T_ROWS + 0.3, T_ROWS + 0.9) * fade;
+  if (la > 0) { const lx = work[0] - H * 0.045;
+    ctx.font = font(H * 0.022, 500); ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillStyle = rgba(MUTED, la);
+    ["", "1", "2", "3", "4", "N"].forEach((s, r) => { if (s) ctx.fillText(s, lx, rowY[r]); });
+    ctx.fillText("⋮", lx, (rowY[4] + rowY[5]) / 2);
+    ctx.textAlign = "left"; ctx.fillText("layers · capas", work[0] - H * 0.06, rowY[5] - H * 0.05); }
+}
+
+// 5–6. Next-token probabilities, then sampling
+function drawChart(t) {
+  if (t < T_CHART[0] || t > T_CHART[1]) return;
+  const { chart: C, P, H, W, work, rowY, T } = L;
+  const ca = prog(t, T_CHART[0], T_CHART[0] + 0.5) * (1 - prog(t, T_CHART[1] - 0.6, T_CHART[1]));
+  const ry = k => C.y0 + k * C.dy, src = [work[T - 1] + L.ox, rowY[5]], rev = easeOut(prog(t, T_CHART[0], T_CHART[0] + 0.7));
+
+  ctx.textBaseline = "middle"; ctx.textAlign = "left"; ctx.font = font(C.fs * 0.85, 500); ctx.fillStyle = rgba(MUTED, ca);
+  ctx.fillText("Next token? · ¿Siguiente token?", C.x0, C.titleY);
+  P.cands.forEach(([tk, p], k) => {
+    const y = ry(k), g = easeOut(prog(t, 26.9 + k * 0.12, 27.9 + k * 0.12));
+    const dst = [C.labR - measure(label(tk), C.fs) - H * 0.015, y], a = [src, [lerp(src[0], dst[0], 0.6), src[1]], dst];
+    ctx.lineWidth = H * (0.001 + 0.006 * p); ctx.strokeStyle = rgba([255, 240, 200], (0.1 + 0.5 * p) * ca);
+    ctx.beginPath(); for (let s = 0; s <= Math.round(40 * rev); s++) { const q = bez(a, s / 40); s ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); } ctx.stroke();
+    const gone = k === P.pick && t >= T_FLY[0] ? 0.35 : 1;      // the picked token has flown into the text
+    ctx.font = font(C.fs); ctx.textAlign = "right"; ctx.fillStyle = rgba(INK, ca * g * gone); ctx.fillText(label(tk), C.labR, y);
+    const bh = C.dy * 0.42, bw = Math.max(2, C.barMax * p * g);
+    ctx.fillStyle = rgba(BAR, 0.75 * ca * g); rrect(C.barX, y - bh / 2, bw, bh, bh * 0.25); ctx.fill();
+    ctx.font = font(C.fs * 0.8, 500, MONO); ctx.textAlign = "left"; ctx.fillStyle = rgba(MUTED, ca * g);
+    ctx.fillText(pct(p), C.barX + bw + H * 0.01, y);
+  });
+  ctx.font = font(C.fs * 0.7, 400); ctx.textAlign = "left"; ctx.fillStyle = rgba(MUTED, ca * prog(t, 28.0, 28.5));
+  ctx.fillText("+ tens of thousands more · decenas de miles más", C.x0, ry(5) - C.dy * 0.2);
+
+  if (t >= T_SAMPLE[0]) {
+    let k = P.pick;
+    if (t < T_SAMPLE[1]) { let acc = T_SAMPLE[0]; for (const h of L.hops) { acc += h.d; if (t < acc) { k = h.k; break; } } }
+    const settled = t >= T_SAMPLE[1], y = ry(k);
+    rrect(C.x0 - H * 0.012, y - C.dy * 0.45, C.barX + C.barMax + W * 0.045 - C.x0 + H * 0.012, C.dy * 0.9, H * 0.012);
+    ctx.lineWidth = H * (settled ? 0.004 : 0.0025); ctx.strokeStyle = rgba(GOLD, ca * (settled ? 1 : 0.8)); ctx.stroke();
+  }
+}
+
+// Tokens: typed text → chips → working row → back to a sentence
+function drawTokens(t) {
+  const { P, T, N, all, H, sfs, sentY, sent, split, wfs, chipY, tokCol } = L;
+  const work = L.work.map(x => x + L.ox);
+  if (t < T_SPLIT[0]) {
+    const full = P.toks.join(""), s = full.slice(0, Math.floor(full.length * prog(t, T_TYPE[0], T_TYPE[1])));
+    ctx.font = font(sfs); ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillStyle = rgba(INK, 1);
+    ctx.fillText(s, sent.x0, sentY + sfs * 0.03);
+    const typing = s.length > 0 && s.length < full.length;
+    if (typing || Math.floor(t * 2.2) % 2 === 0) { ctx.fillStyle = rgba(GOLD, 0.9);
+      ctx.fillRect(sent.x0 + measure(s, sfs) + sfs * 0.08, sentY - sfs * 0.55, sfs * 0.07, sfs * 1.1); }
+    return;
+  }
+  if (t < T_MERGE[0]) {
+    const k = easeInOut(prog(t, T_SPLIT[0], T_SPLIT[1])), m = easeInOut(prog(t, T_WORK[0], T_WORK[1]));
+    const fs = lerp(sfs, wfs, m), cy = lerp(sentY, chipY, m);
+    const ia = prog(t, T_IDS, T_IDS + 0.3) * (1 - prog(t, T_WORK[0], T_WORK[0] + 0.4));
+    for (let i = 0; i < T; i++) {
+      const cx = lerp(lerp(sent.runs[i].cx, split[i], k), work[i], m);
+      chip(cx, cy, fs, label(P.toks[i]), tokCol[i], k, INK, 1);
+      if (ia > 0) { const id = String(P.ids[i]), t0 = T_IDS + 0.2 + i * 0.1; let s = "";
+        for (let d = 0; d < id.length; d++) s += t >= t0 + d * 0.12 ? id[d] : String(Math.floor(hash(Math.floor(t * 24) * 31 + d + i * 7) * 10));
+        ctx.font = font(sfs * 0.5, 500, MONO); ctx.fillStyle = rgba(mix(tokCol[i], INK, 0.4), ia); ctx.fillText(s, cx, cy + sfs * 1.25); }
+    }
+    if (t >= T_FLY[0]) {                    // the picked token flies from the chart into the text
+      const f = easeInOut(prog(t, T_FLY[0], T_FLY[1])), C = L.chart, lab = label(all[T]);
+      const sx = C.labR - measure(lab, C.fs) / 2, sy = C.y0 + P.pick * C.dy;
+      chip(lerp(sx, work[T], f), lerp(sy, chipY, f) - Math.sin(f * Math.PI) * H * 0.08, lerp(C.fs, wfs, f), lab, GOLD, f, INK, 1);
+    }
+    if (t >= T_SECOND[0]) {                 // ...and the next one comes out of the network
+      const f = easeOut(prog(t, T_SECOND[0], T_SECOND[1]));
+      chip(work[T + 1], lerp(L.rowY[5], chipY, f), wfs, label(all[T + 1]), GOLD, 1, INK, f);
+    }
+    return;
+  }
+  const m = easeInOut(prog(t, T_MERGE[0], T_MERGE[1]));
+  for (let i = 0; i < N; i++) {
+    const a = t > T_DISSOLVE ? 1 - prog(t, L.finOff[i], L.finOff[i] + 0.45) : 1; if (a <= 0) continue;
+    const gen = i >= T, fs = lerp(wfs, L.ffs, m);
+    if (gen) { ctx.shadowColor = rgba(GOLD, 0.7 * m); ctx.shadowBlur = fs * 0.35 * L.fxScale * (0.8 + 0.2 * Math.sin(t * 2)); }
+    chip(lerp(work[i], L.fin.runs[i].cx, m), lerp(chipY, sentY, m), fs, label(all[i]), tokCol[i], 1 - m, gen ? mix(INK, GOLD, m) : INK, a);
+    ctx.shadowBlur = 0; ctx.shadowColor = "transparent";
+  }
+}
+
+function drawDust(t) {
+  if (t < T_DISSOLVE) return;
+  const { dust, H } = L;
+  dust.forEach(p => { const u = t - p.t0; if (u < 0 || u > 2.4) return;
+    const a = (u < 0.15 ? u / 0.15 : 1) * (1 - u / 2.4);
+    const x = p.x + p.vx * u * (0.6 + u * 0.4) + Math.sin(p.ph + u * 3) * H * 0.006 * u;
+    const y = p.y + p.vy * u * (0.5 + u * 0.5) + Math.cos(p.ph + u * 2.3) * H * 0.004 * u;
+    dotf(x, y, H * (0.0012 + p.s * 0.0014), p.gold ? GOLD : [214, 200, 180], 0.85 * a); });
+}
+
+/* ===================== DOM: steps + captions ===================== */
+let lastStep = -2;
+function updateDom(t) {
+  const scene = SCENES.findIndex((s, i) => t >= s.a - 0.2 && t < (SCENES[i + 1] ? SCENES[i + 1].a - 0.2 : 36.5));
+  const step = scene >= 0 ? SCENES[scene].step : -1;
+  if (step !== lastStep) { lastStep = step; stepEls.forEach((el, i) => { el.classList.toggle("on", i === step); el.classList.toggle("done", step >= 0 && i < step); }); }
+  stepsEl.style.opacity = win(t, 0.2, 37.0, 0.6, 0.6);
+
+  let cap = null, capOp = 0;
+  if (scene >= 0) { const s = SCENES[scene], st = STEPS[s.step];
+    cap = { tag: `${s.step + 1} · ${st.en}` + (st.es !== st.en ? ` · ${st.es}` : ""), en: s.en, es: s.es };
+    capOp = win(t, s.a, s.b, 0.35, 0.3);
+  } else if (t >= T_BEAT[0] && t < T_BEAT[1]) { cap = BEATS[beatIdx]; capOp = win(t, T_BEAT[0], T_BEAT[1], 0.4, 0.5); }
+  if (cap && capTag.dataset.k !== cap.en) { capTag.textContent = cap.tag; capEn.textContent = cap.en; capEs.textContent = cap.es; capTag.dataset.k = cap.en; }
+  capEl.style.opacity = capOp;
+}
+
+/* ===================== Main loop ===================== */
+let start = performance.now(), lastCycle = null, cycleBase = 0;
+try { cycleBase = parseInt(localStorage.getItem("nextTokenCycle") || "0", 10) || 0; } catch (e) {}
+
+function chooseCycle(cycle) {
+  const n = cycleBase + cycle;
+  const p = FORCED_PROMPT !== null ? FORCED_PROMPT : n;
+  beatIdx = ((FORCED_BEAT !== null ? FORCED_BEAT : n) % BEATS.length + BEATS.length) % BEATS.length;
+  try { localStorage.setItem("nextTokenCycle", String(n + 1)); } catch (e) {}
+  const pi = (p % PROMPTS.length + PROMPTS.length) % PROMPTS.length;
+  if (pi !== promptIdx || !L) { promptIdx = pi; layout(); }
+}
+
+function frame(now) {
+  const elapsed = FROZEN_T !== null ? FROZEN_T : (now - start) / 1000;
+  const cycle = Math.floor(elapsed / CYCLE), t = elapsed - cycle * CYCLE;
+  if (cycle !== lastCycle) { lastCycle = cycle; chooseCycle(cycle); }
+  ctx.setTransform(L.fxScale, 0, 0, L.fxScale, 0, 0);
+  ctx.clearRect(0, 0, L.W, L.H);
+  drawField(elapsed, t);
+  // The network is centered for steps 2–4, then slides left to make room for the chart
+  L.ox = L.centerOff * (1 - easeInOut(prog(t, 25.3, 26.2)));
+  ctx.save(); ctx.translate(L.ox, 0); drawColumns(t); drawAttention(t); drawGrid(t); ctx.restore();
+  drawChart(t); drawTokens(t); drawDust(t);
+  updateDom(t);
+  if (FROZEN_T === null) requestAnimationFrame(frame);
+}
+
+/* ===================== Exit (kiosk) ===================== */
+if (KIOSK) {
+  hintEl.style.opacity = 1; setTimeout(() => hintEl.style.opacity = 0, 6000);
+  const armedAt = performance.now() + 1500;
+  const quit = () => { if (performance.now() < armedAt) return; window.close(); };
+  addEventListener("pointerdown", quit); addEventListener("touchstart", quit, { passive: true }); addEventListener("keydown", quit);
+}
+
+/* ===================== Start ===================== */
+let resizeTimer = null;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (L) layout(); if (FROZEN_T !== null) requestAnimationFrame(frame); }, 200); });
+(document.fonts ? document.fonts.ready : Promise.resolve()).then(() => {
+  window.__ready = true;
+  requestAnimationFrame(frame);
+});
+})();
+</script>
+</body>
+</html>
