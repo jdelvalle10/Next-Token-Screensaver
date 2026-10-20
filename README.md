@@ -16,6 +16,10 @@ window and knowledge cutoff, randomness), and the sentence dissolves.
 The example prompt changes every loop and alternates between English and Spanish (6 prompts).
 Token IDs, attention weights and probabilities are **illustrative**, not taken from a real model.
 
+## Windows
+
+A Windows screensaver (`.scr`) is in the [`windows`](windows/) folder. See its README.
+
 ## Install (Ubuntu 24.04, Firefox)
 
 1. Copy this folder to the smartboard PC (USB drive or download).
